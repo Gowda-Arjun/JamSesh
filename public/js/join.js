@@ -27,7 +27,6 @@ loadScript("https://unpkg.com/timesync/dist/timesync.min.js").then(() => {
 
 
     const FIXED_DELAY_MS = 400;
-    const LATENCY_UPDATE_INTERVAL_MS = 5000;
 
     let ws;
     let clientId = null;
@@ -36,6 +35,10 @@ loadScript("https://unpkg.com/timesync/dist/timesync.min.js").then(() => {
     let startCall = false;
     const iceServers = [];
     let allParticipants = [];
+
+    // Stores the server-clock time at which the host sent the WebRTC offer.
+    // Used to compute one-way transit latency on the listener side.
+    let hostOfferServerTime = null;
 
     const BITRATE_LEVELS = {
         HIGH: 192000,   // 192 kbps 
@@ -164,6 +167,13 @@ loadScript("https://unpkg.com/timesync/dist/timesync.min.js").then(() => {
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
 
+                // Record the server-clock time the host stamped on this offer.
+                // This is the anchor for computing one-way transit latency.
+                if (data.hostServerTime != null) {
+                    hostOfferServerTime = data.hostServerTime;
+                    console.log(`Host offer server time: ${hostOfferServerTime}, current server time: ${Date.now() + timeOffset}, latency ≈ ${(Date.now() + timeOffset) - hostOfferServerTime} ms`);
+                }
+
                 ws.send(JSON.stringify({
                     type: 'answer',
                     sdp: pc.localDescription,
@@ -227,36 +237,52 @@ loadScript("https://unpkg.com/timesync/dist/timesync.min.js").then(() => {
             // plays audio
             console.log('Remote track received', event.streams[0]);
 
+            if (remoteAudio) {
+                remoteAudio.srcObject = event.streams[0];
+                remoteAudio.play()
+                    .catch(e => {
+                        console.warn("Autoplay was blocked. User must interact with the page first.", e.name);
+                    });
+            } else {
+                console.warn("Remote audio element not found");
+            }
+
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             const source = audioCtx.createMediaStreamSource(event.streams[0]);
-            const delayNode = audioCtx.createDelay(FIXED_DELAY_MS / 1000);
-            source.connect(delayNode).connect(audioCtx.destination);
-            peerConnections[peerId].audioContext = audioCtx;
+            source.connect(audioCtx.destination);
 
-            // WebRTC exposes round-trip time, so half of it is the best available
-            // estimate of the media's one-way network travel time at the listener.
-            const updatePlaybackDelay = async () => {
-                const oneWayLatencyMs = await getOneWayLatencyMs(pc);
-                const delayMs = Math.max(0, FIXED_DELAY_MS - oneWayLatencyMs);
-                const targetDelaySeconds = delayMs / 1000;
+            // === Synchronized playback ===
+            // Goal: every listener plays the same audio packet at the same wall-clock
+            // moment, regardless of their individual network latency to the host.
+            //
+            // Algorithm:
+            //   latency   = server_time_now - hostOfferServerTime
+            //             = how long it took audio data to travel host → this listener
+            //   delayMs   = FIXED_DELAY_MS - latency
+            //             = how long this listener must wait before starting playback
+            //
+            // Example:
+            //   Listener A: latency=150ms → wait 250ms
+            //   Listener B: latency=300ms → wait 100ms
+            //   Both start playing at the same absolute moment.
+            //
+            // If latency >= FIXED_DELAY_MS the listener is already behind; play immediately.
 
-                // A short ramp avoids clicks when the network estimate changes.
-                delayNode.delayTime.setTargetAtTime(
-                    targetDelaySeconds,
-                    audioCtx.currentTime,
-                    0.05
-                );
-                console.log(`network latency: ${oneWayLatencyMs.toFixed(0)} ms; audio delay: ${delayMs.toFixed(0)} ms`);
-            };
+            const serverTimeNow = Date.now() + timeOffset;
+            const latency = (hostOfferServerTime != null)
+                ? Math.max(0, serverTimeNow - hostOfferServerTime)
+                : 0;
+            const delayMs = Math.max(0, FIXED_DELAY_MS - latency);
 
-            updatePlaybackDelay();
-            const intervalId = setInterval(updatePlaybackDelay, LATENCY_UPDATE_INTERVAL_MS);
-            peerConnections[peerId].syncInterval = intervalId;
+            console.log(`[sync] hostOfferServerTime=${hostOfferServerTime}, serverTimeNow=${serverTimeNow}, latency=${latency}ms, delayMs=${delayMs}ms`);
 
-            audioCtx.resume().catch(error => {
-                console.warn('Unable to start synchronized audio:', error);
+            audioCtx.suspend().then(() => {
+                setTimeout(() => {
+                    audioCtx.resume();
+                    console.log(`[sync] Resumed AudioContext after ${delayMs}ms delay (latency was ${latency}ms).`);
+                }, delayMs);
             });
-        };
+        }
 
         pc.onconnectionstatechange = () => {
             console.log(`Peer Connection State for ${peerId}:`, pc.connectionState);
@@ -274,25 +300,6 @@ loadScript("https://unpkg.com/timesync/dist/timesync.min.js").then(() => {
         };
 
         return pc;
-    }
-
-    async function getOneWayLatencyMs(pc) {
-        const stats = await pc.getStats();
-        let roundTripTime = null;
-
-        stats.forEach(report => {
-            if (report.type !== 'candidate-pair' || report.state !== 'succeeded') {
-                return;
-            }
-
-            if (report.nominated || report.selected) {
-                roundTripTime = report.currentRoundTripTime;
-            }
-        });
-
-        // Until ICE reports an RTT, keep the full target delay as a conservative
-        // fallback. This never makes playback earlier than the synchronization target.
-        return typeof roundTripTime === 'number' ? (roundTripTime * 1000) / 2 : 0;
     }
 
     // set a new bitrate for a specific peer
@@ -375,9 +382,6 @@ loadScript("https://unpkg.com/timesync/dist/timesync.min.js").then(() => {
 
             if (peer.syncInterval) {
                 clearInterval(peer.syncInterval);
-            }
-            if (peer.audioContext) {
-                peer.audioContext.close();
             }
             if (peer.pc) {
                 peer.pc.close();
